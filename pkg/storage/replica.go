@@ -251,8 +251,9 @@ type Replica struct {
 	// TODO(tschottdorf): Duplicates r.mu.state.desc.RangeID; revisit that.
 	RangeID roachpb.RangeID // Should only be set by the constructor.
 
-	store      *Store
-	abortCache *AbortCache // Avoids anomalous reads after abort
+	store        *Store
+	abortCache   *AbortCache   // Avoids anomalous reads after abort
+	pushTxnQueue *pushTxnQueue // Queues push txn attempts by txn ID
 
 	// creatingReplica is set when a replica is created as uninitialized
 	// via a raft message.
@@ -548,6 +549,7 @@ func newReplica(rangeID roachpb.RangeID, store *Store) *Replica {
 		RangeID:        rangeID,
 		store:          store,
 		abortCache:     NewAbortCache(rangeID),
+		pushTxnQueue:   newPushTxnQueue(store),
 	}
 
 	// Init rangeStr with the range ID.
@@ -1883,18 +1885,21 @@ func (r *Replica) addReadOnlyCmd(
 		return nil, roachpb.NewError(err)
 	}
 
+	if ba.Txn != nil {
+		// Checking whether the transaction has been aborted on reads
+		// makes sure that we don't experience anomalous conditions as
+		// described in #2231.
+		if pErr = r.checkIfTxnAborted(ctx, r.store.Engine(), *ba.Txn); pErr != nil {
+			return nil, pErr
+		}
+	}
+
 	// Execute read-only batch command. It checks for matching key range; note
 	// that holding readMu throughout is important to avoid reads from the
 	// "wrong" key range being served after the range has been split.
 	var result EvalResult
 	br, result, pErr = r.executeBatch(ctx, storagebase.CmdIDKey(""), r.store.Engine(), nil, ba)
 
-	if pErr == nil && ba.Txn != nil {
-		// Checking whether the transaction has been aborted on reads
-		// makes sure that we don't experience anomalous conditions as
-		// described in #2231.
-		pErr = r.checkIfTxnAborted(ctx, r.store.Engine(), *ba.Txn)
-	}
 	if intents := result.Local.detachIntents(); len(intents) > 0 {
 		log.Eventf(ctx, "submitting %d intents to asynchronous processing", len(intents))
 		r.store.intentResolver.processIntentsAsync(r, intents)
@@ -2003,6 +2008,21 @@ func (r *Replica) tryAddWriteCmd(
 	isNonKV := ba.IsNonKV()
 	var endCmds *endCmds
 	if !isNonKV {
+		// If this is a push txn request, check the push queue first, which
+		// may cause this request to wait and either return a successful push
+		// txn response or else allow this request to proceed.
+		if ba.IsSinglePushTxnRequest() {
+			pushReq := ba.Requests[0].GetInner().(*roachpb.PushTxnRequest)
+			pushResp, pErr := r.pushTxnQueue.MaybeWait(ctx, pushReq)
+			if pErr != nil {
+				return nil, pErr, proposalNoRetry
+			} else if pushResp != nil {
+				br := &roachpb.BatchResponse{}
+				br.Add(pushResp)
+				return br, nil, proposalNoRetry
+			}
+		}
+
 		// Add the write to the command queue to gate subsequent overlapping
 		// commands until this command completes. Note that this must be
 		// done before getting the max timestamp for the key(s), as
@@ -3959,8 +3979,7 @@ func (r *Replica) executeWriteBatch(
 
 	batch.Close()
 	batch = r.store.Engine().NewBatch()
-	log.VEventf(ctx, 2, "1PC execution failed, reverting to regular execution for "+
-		"batch: %s", batch)
+	log.VEventf(ctx, 2, "1PC execution failed, reverting to regular execution for %s: %s", ba, pErr)
 	ms = enginepb.MVCCStats{}
 	br, result, pErr = r.executeBatch(ctx, idKey, batch, &ms, ba)
 	return batch, ms, br, result, pErr

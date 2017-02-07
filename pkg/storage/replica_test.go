@@ -3814,7 +3814,7 @@ func TestReplicaResolveIntentNoWait(t *testing.T) {
 // aborted, the abort cache on the respective Range is poisoned and
 // the pushee is presented with a txn abort on its next contact with
 // the Range in the same epoch.
-func TestSequenceCachePoisonOnResolve(t *testing.T) {
+func TestAbortCachePoisonOnResolve(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	key := roachpb.Key("a")
 
@@ -6662,7 +6662,7 @@ func TestAmbiguousResultErrorOnRetry(t *testing.T) {
 	var ba1PCTxn roachpb.BatchRequest
 	{
 		key := roachpb.Key("1pc")
-		txn := newTransaction("1pc", key, 1, enginepb.SERIALIZABLE, tc.Clock())
+		txn := newTransaction("1pc", key, -1, enginepb.SERIALIZABLE, tc.Clock())
 		bt, _ := beginTxnArgs(key, txn)
 		put := putArgs(key, []byte("value"))
 		et, etH := endTxnArgs(txn, true)
@@ -6677,7 +6677,7 @@ func TestAmbiguousResultErrorOnRetry(t *testing.T) {
 		checkFn func(*roachpb.Error) error
 	}{
 		{
-			name: "non-tnx-put",
+			name: "non-txn-put",
 			ba:   baPut,
 			checkFn: func(pErr *roachpb.Error) error {
 				detail := pErr.GetDetail()
@@ -6699,7 +6699,7 @@ func TestAmbiguousResultErrorOnRetry(t *testing.T) {
 		{
 			// This test checks two things:
 			// - that we can do retries of 1pc batches
-			// - that they fail ambiguously if the original command had been applied
+			// - that they fail ambiguously if the original command was applied
 			name: "1PC-txn",
 			ba:   ba1PCTxn,
 			checkFn: func(pErr *roachpb.Error) error {
@@ -6725,7 +6725,7 @@ func TestAmbiguousResultErrorOnRetry(t *testing.T) {
 				if _, ok := detail.(*roachpb.TransactionRetryError); !ok {
 					return errors.Wrapf(detail,
 						"expected the AmbiguousResultError to be caused by a "+
-							"WriteTooOldError, got %T", detail)
+							"TransactionRetryError, got %T", detail)
 				}
 
 				// Test that the original proposal succeeded by checking the effects of

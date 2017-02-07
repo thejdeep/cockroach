@@ -312,7 +312,6 @@ func TestClientRunTransaction(t *testing.T) {
 	s, _, _ := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop()
 	dbCtx := client.DefaultDBContext()
-	dbCtx.TxnRetryOptions.InitialBackoff = 1 * time.Millisecond
 	db := createTestClientForUser(t, s, security.NodeUser, dbCtx)
 
 	for _, commit := range []bool{true, false} {

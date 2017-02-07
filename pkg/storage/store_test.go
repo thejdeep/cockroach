@@ -50,7 +50,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
@@ -67,19 +66,6 @@ var testIdent = roachpb.StoreIdent{
 	ClusterID: uuid.MakeV4(),
 	NodeID:    1,
 	StoreID:   1,
-}
-
-// testRetryOptions returns retry options with aggressive retries and a limit
-// on number of attempts so we don't get stuck behind indefinite backoff/retry
-// loops.
-// Using this is generally considered bad taste and legacy.
-func testRetryOptions() retry.Options {
-	return retry.Options{
-		InitialBackoff: 1 * time.Millisecond,
-		MaxBackoff:     2 * time.Millisecond,
-		Multiplier:     2,
-		MaxRetries:     1,
-	}
 }
 
 // testSender is an implementation of the client.Sender interface
@@ -1194,7 +1180,7 @@ func TestStoreSetRangesMaxBytes(t *testing.T) {
 func TestStoreLongTxnStarvation(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := TestStoreConfig(nil)
-	storeCfg.RangeRetryOptions = testRetryOptions()
+	storeCfg.DontRetryPushTxnFailures = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	store := createTestStoreWithConfig(t, stopper, &storeCfg)
@@ -1215,8 +1201,8 @@ func TestStoreLongTxnStarvation(t *testing.T) {
 			if pErr != nil && retry == 0 {
 				t.Fatalf("%d: unexpected error on first put: %s", i, pErr)
 			} else if retry == 1 {
-				if _, ok := pErr.GetDetail().(*roachpb.WriteIntentError); !ok {
-					t.Fatalf("%d: expected write intent error; got %s", i, pErr)
+				if _, ok := pErr.GetDetail().(*roachpb.TransactionPushError); !ok {
+					t.Fatalf("%d: expected TransactionPushError; got %s", i, pErr)
 				}
 			}
 
@@ -1247,12 +1233,13 @@ func TestStoreLongTxnStarvation(t *testing.T) {
 	}
 }
 
-// TestStoreResolveWriteIntent adds write intent and then verifies
+// TestStoreResolveWriteIntent adds a write intent and then verifies
 // that a put returns success and aborts intent's txn in the event the
-// pushee has lower priority. Otherwise, verifies that a
-// TransactionPushError is returned.
+// pushee has lower priority. Otherwise, verifies that the put blocks
+// until the original txn is ended.
 func TestStoreResolveWriteIntent(t *testing.T) {
 	defer leaktest.AfterTest(t)()
+
 	manual := hlc.NewManualClock(123)
 	cfg := TestStoreConfig(hlc.NewClock(manual.UnixNano, time.Nanosecond))
 	cfg.TestingKnobs.TestingCommandFilter =
@@ -1293,8 +1280,14 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 		manual.Increment(100)
 		// Now, try a put using the pusher's txn.
 		h.Txn = pusher
-		_, pErr := client.SendWrappedWith(context.Background(), store.testSender(), h, &pArgs)
+		resultCh := make(chan *roachpb.Error, 1)
+		go func() {
+			_, pErr := client.SendWrappedWith(context.Background(), store.testSender(), h, &pArgs)
+			resultCh <- pErr
+		}()
+
 		if resolvable {
+			pErr := <-resultCh
 			if pErr != nil {
 				t.Fatalf("expected intent resolved; got unexpected error: %s", pErr)
 			}
@@ -1308,15 +1301,22 @@ func TestStoreResolveWriteIntent(t *testing.T) {
 				t.Fatalf("expected pushee to be aborted; got %s", txn.Status)
 			}
 		} else {
-			if rErr, ok := pErr.GetDetail().(*roachpb.TransactionPushError); !ok {
-				t.Fatalf("expected txn push error; got %s", pErr)
-			} else if !roachpb.TxnIDEqual(rErr.PusheeTxn.ID, pushee.ID) {
-				t.Fatalf("expected txn to match pushee %q; got %s", pushee.ID, rErr)
+			var pErr *roachpb.Error
+			select {
+			case pErr = <-resultCh:
+				t.Fatalf("did not expect put to complete with lower priority: %s", pErr)
+			case <-time.After(10 * time.Millisecond):
+				// Send an end transaction to allow the original push to complete.
+				etArgs, h := endTxnArgs(pushee, true)
+				pushee.Sequence++
+				_, pErr := client.SendWrappedWith(context.Background(), store.testSender(), h, &etArgs)
+				if pErr != nil {
+					t.Fatal(pErr)
+				}
+				pErr = <-resultCh
 			}
-			// Trying again should fail again.
-			h.Txn.Sequence++
-			if _, pErr := client.SendWrappedWith(context.Background(), store.testSender(), h, &pArgs); pErr == nil {
-				t.Fatalf("expected another error on latent write intent but succeeded")
+			if pErr != nil {
+				t.Fatalf("expected successful put after pushee txn ended; got %s", pErr)
 			}
 		}
 	}
@@ -1365,7 +1365,7 @@ func TestStoreResolveWriteIntentRollback(t *testing.T) {
 func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	storeCfg := TestStoreConfig(nil)
-	storeCfg.RangeRetryOptions = testRetryOptions()
+	storeCfg.DontRetryPushTxnFailures = true
 	stopper := stop.NewStopper()
 	defer stopper.Stop()
 	store := createTestStoreWithConfig(t, stopper, &storeCfg)
@@ -1474,8 +1474,8 @@ func TestStoreResolveWriteIntentPushOnRead(t *testing.T) {
 				if pErr == nil {
 					t.Errorf("expected read to fail")
 				}
-				if _, ok := pErr.GetDetail().(*roachpb.TransactionRetryError); !ok {
-					t.Errorf("iso=%s; expected transaction retry error; got %T", test.pusheeIso, pErr.GetDetail())
+				if _, ok := pErr.GetDetail().(*roachpb.TransactionPushError); !ok {
+					t.Errorf("iso=%s; expected transaction push error; got %T", test.pusheeIso, pErr.GetDetail())
 				}
 			}
 		}

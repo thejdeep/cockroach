@@ -31,7 +31,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/caller"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 )
 
@@ -503,16 +502,11 @@ func (e *AutoCommitError) Error() string {
 func (txn *Txn) Exec(opt TxnExecOptions, fn func(txn *Txn, opt *TxnExecOptions) error) (err error) {
 	// Run fn in a retry loop until we encounter a success or
 	// error condition this loop isn't capable of handling.
-	var retryOptions retry.Options
 	if txn == nil && (opt.AutoRetry || opt.AutoCommit) {
 		panic("asked to retry or commit a txn that is already aborted")
 	}
 
-	if opt.AutoRetry {
-		retryOptions = txn.db.ctx.TxnRetryOptions
-	}
-
-	for r := retry.Start(retryOptions); r.Next(); {
+	for {
 		if txn != nil {
 			// If we're looking at a brand new transaction, then communicate
 			// what should be used as initial timestamp for the KV txn created
@@ -557,9 +551,6 @@ func (txn *Txn) Exec(opt TxnExecOptions, fn func(txn *Txn, opt *TxnExecOptions) 
 		retErr, retryable = err.(*roachpb.RetryableTxnError)
 		if !opt.AutoRetry || !retryable {
 			break
-		}
-		if !retErr.Backoff {
-			r.Reset()
 		}
 
 		txn.commitTriggers = nil

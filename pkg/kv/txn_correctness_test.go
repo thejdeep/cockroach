@@ -27,7 +27,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"golang.org/x/net/context"
 
@@ -37,24 +36,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/localtestcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
-	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/pkg/errors"
 )
-
-// correctnessTestRetryOptions uses aggressive retries with a limit on
-// number of attempts so we don't get stuck behind indefinite
-// backoff/retry loops. If MaxAttempts is reached, transaction will
-// return retry error.
-//
-// Note that these options are used twice, at the stores via
-// setCorrectnessRetryOptions, and when constructing the client.
-var correctnessTestRetryOptions = retry.Options{
-	InitialBackoff: 1 * time.Millisecond,
-	MaxBackoff:     10 * time.Millisecond,
-	Multiplier:     10,
-	MaxRetries:     2,
-}
 
 type retryError struct {
 	txnIdx, cmdIdx int
@@ -899,11 +883,8 @@ func checkConcurrency(
 	name string, isolations []enginepb.IsolationType, txns []string, verify *verifier, t *testing.T,
 ) {
 	verifier := newHistoryVerifier(name, txns, verify, t)
-	dbCtx := client.DefaultDBContext()
-	dbCtx.TxnRetryOptions = correctnessTestRetryOptions
 	s := &localtestcluster.LocalTestCluster{
-		DBContext:         &dbCtx,
-		RangeRetryOptions: &correctnessTestRetryOptions,
+		DontRetryPushTxnFailures: true,
 	}
 	s.Start(t, testutils.NewNodeTestBaseContext(), InitSenderForLocalTestCluster)
 	defer s.Stop()
